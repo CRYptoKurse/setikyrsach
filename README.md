@@ -1,1 +1,1 @@
-# setikyrsach
+KYRSOVAIA SETI
