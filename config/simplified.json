@@ -1,0 +1,14 @@
+{
+  "node_id_bits": 256,
+  "bucket_size": 3,
+  "alpha": 3,
+  "replication_factor": 3,
+  "record_ttl_seconds": 180,
+  "refresh_interval_seconds": 30,
+  "republish_interval_seconds": 60,
+  "rpc_timeout_seconds": 0.8,
+  "required_relays": 2,
+  "max_tunnel_hops": 8,
+  "tunnel_ttl_seconds": 120,
+  "max_frame_payload": 65536
+}
