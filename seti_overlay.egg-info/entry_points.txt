@@ -1,0 +1,2 @@
+[console_scripts]
+seti-overlay = overlay.cli:main
