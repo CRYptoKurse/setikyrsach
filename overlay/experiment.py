@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import csv
 import hashlib
 import json
 import platform
 import random
 import statistics
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .core import NodeRecord, ProtocolError, node_record_key
+from .core import NodeRecord, node_record_key
 from .config import OverlayConfig
+from .capture import PacketCapture
 from .network import OverlayNetwork
 
 
@@ -27,14 +26,25 @@ def distribution(values: list[float]) -> dict:
 
 async def run_acceptance(output_dir: str | Path, count: int = 12, bootstrap: str = "star",
                          base_port: int = 19000, seed: int = 20261012,
-                         config: OverlayConfig | None = None) -> dict:
+                         config: OverlayConfig | None = None,
+                         capture_packets: bool = True) -> dict:
+    if not 12 <= count <= 15:
+        raise ValueError("the simplified acceptance experiment uses 12..15 logical nodes")
+    if bootstrap not in {"star", "ring"}:
+        raise ValueError("bootstrap must be star or ring")
+    active_config = config or OverlayConfig()
+    active_config.validate()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    network = OverlayNetwork(output_path / "state", count=count, base_port=base_port,
+                             bootstrap=bootstrap, config=active_config)
+    capture = PacketCapture(output_path / "network-traffic.pcapng", base_port, count) if capture_packets else None
+    if capture:
+        capture.start()
     started_wall = datetime.now(timezone.utc)
     started = time.perf_counter()
     random.seed(seed)
-    network = OverlayNetwork(output_path / "state", count=count, base_port=base_port,
-                             bootstrap=bootstrap, config=config)
+    network_stopped = False
     results: dict = {"schema_version": 1, "started_at": started_wall.isoformat(), "seed": seed,
                      "code_version": __version__, "python_version": platform.python_version(),
                      "platform": platform.platform()}
@@ -43,6 +53,12 @@ async def run_acceptance(output_dir: str | Path, count: int = 12, bootstrap: str
         results["config"] = network.summary()
         results["cold_convergence_ms"] = network.cold_convergence_ms
         results["startup_total_ms"] = (time.perf_counter() - started) * 1000
+        converged_node_tables = [
+            {"node_id": node.identity.node_id,
+             "total_contacts": len(node.routing.all_contacts()),
+             "bucket_sizes": node.routing.bucket_sizes()}
+            for node in network.nodes
+        ]
 
         bootstrap_node = network.node(0)
         reader = network.node(1)
@@ -61,9 +77,9 @@ async def run_acceptance(output_dir: str | Path, count: int = 12, bootstrap: str
 
         lookup_initiator = network.node(1)
         lookup_targets = [node.identity.node_id for node in network.nodes
-                  if node.identity.node_id != lookup_initiator.identity.node_id
-                          if node.identity.node_id not in {peer.node_id for peer in lookup_initiator.routing.all_contacts()}]
-        lookup_target = lookup_targets[0] if lookup_targets else network.node(count - 1).identity.node_id
+                          if node.identity.node_id != lookup_initiator.identity.node_id]
+        lookup_target = lookup_targets[0]
+        lookup_initiator._remove_contact(lookup_target)
         failed_candidate = lookup_initiator.routing.closest(lookup_target, 1)[0]
         candidate_node = next(node for node in network.nodes if node.identity.node_id == failed_candidate.node_id)
         await candidate_node.stop()
@@ -89,20 +105,25 @@ async def run_acceptance(output_dir: str | Path, count: int = 12, bootstrap: str
                 break
             initiator = network.node(initiator_index)
             target_id = node_ids[target_index]
-            if target_id in {peer.node_id for peer in initiator.routing.all_contacts()}:
+            initiator._remove_contact(target_id)
+            target_absent_before = target_id not in {
+                peer.node_id for peer in initiator.routing.all_contacts()
+            }
+            if not target_absent_before:
                 continue
             lookup = await initiator.lookup_node(target_id)
             lookup_observations.append({
                 "lookup_id": lookup.lookup_id,
                 "initiator_id": initiator.identity.node_id,
                 "target_id": target_id,
-                "target_absent_before": True,
+                "target_absent_before": target_absent_before,
                 "used_intermediate": any(peer_id != target_id for batch in lookup.queried for peer_id in batch),
                 "target_found": any(peer.node_id == target_id for peer in lookup.contacts),
                 "rpc_count": lookup.rpc_count,
                 "iterations": lookup.iterations,
                 "duration_ms": lookup.duration_ms,
                 "errors": len(lookup.errors),
+                "queried_by_iteration": lookup.queried,
             })
         results["lookups"] = lookup_observations
 
@@ -117,7 +138,7 @@ async def run_acceptance(output_dir: str | Path, count: int = 12, bootstrap: str
             stored = False
             holders = []
             store_attempts = 0
-            while store_attempts < 3:
+            while store_attempts < 8:
                 stored = await publisher.put_record(key, record)
                 holders = [node for node in network.nodes if node.store.get(key) is not None]
                 store_attempts += 1
@@ -147,6 +168,7 @@ async def run_acceptance(output_dir: str | Path, count: int = 12, bootstrap: str
         delivered_messages = []
         for message_index in range(30):
             delivered_messages.append(await sender.send_via_tunnel(baseline_tunnel, f"SETI acceptance message {message_index}"))
+        await sender.close_tunnel(baseline_tunnel)
         results["messages"] = delivered_messages
 
         relay_failures = []
@@ -177,6 +199,9 @@ async def run_acceptance(output_dir: str | Path, count: int = 12, bootstrap: str
                                    "recovered": bool(recovered.get("delivered")), "recovery_ms": recovery_ms,
                                    "recovery_error": recovered.get("error"),
                                    "replacement_relay_ids": recovered.get("relay_ids", [])})
+            recovery_tunnel = sender.tunnels.get(recovered.get("tunnel_id"))
+            if recovery_tunnel and recovery_tunnel["state"] != "DEAD":
+                await sender.close_tunnel(recovery_tunnel)
             await failed_node.start()
         results["relay_failure_injections"] = relay_failures
 
@@ -199,19 +224,32 @@ async def run_acceptance(output_dir: str | Path, count: int = 12, bootstrap: str
                                     if relay_failures else 0),
             "tunnel_build_samples_ms": list(sender.metrics["tunnel_build_ms"]),
         }
-        results["node_tables"] = [{"node_id": node.identity.node_id,
-                                   "total_contacts": len(node.routing.all_contacts()),
-                                   "bucket_sizes": node.routing.bucket_sizes()} for node in network.nodes]
+        results["node_tables"] = converged_node_tables
+        results["tunnel_states"] = [
+            event for node in network.nodes for event in node.tunnel_history
+        ]
         results["duration_seconds"] = time.perf_counter() - started
         results["limitations"] = [
             "This is a localhost prototype; bootstrap schemes do not represent physical IP topologies.",
             "The generated lab CA is an isolated experiment trust anchor, not a discovery service.",
-            "File transfer, network namespaces/netem, browser UI, and packet capture are not part of the simplified profile.",
+            "File transfer, network namespaces/netem, and browser UI are outside the simplified profile.",
         ]
+        await network.stop()
+        network_stopped = True
+        if capture:
+            try:
+                results["capture"] = capture.stop()
+            except RuntimeError as exc:
+                results["capture_error"] = str(exc)
         write_artifacts(output_path, results)
         return results
     finally:
-        await network.stop()
+        try:
+            if not network_stopped:
+                await network.stop()
+        finally:
+            if capture and capture.running:
+                capture.stop()
 
 
 def write_artifacts(output_path: Path, results: dict) -> None:
@@ -219,16 +257,56 @@ def write_artifacts(output_path: Path, results: dict) -> None:
     with (output_path / "lookups.csv").open("w", newline="", encoding="utf-8") as stream:
         rows = results.get("lookups", [])
         columns = ["lookup_id", "initiator_id", "target_id", "target_absent_before", "used_intermediate",
-                   "target_found", "rpc_count", "iterations", "duration_ms", "errors"]
+                   "target_found", "rpc_count", "iterations", "duration_ms", "errors", "queried_by_iteration"]
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({
+            **row, "queried_by_iteration": json.dumps(row.get("queried_by_iteration", [])),
+        } for row in rows)
     with (output_path / "messages.csv").open("w", newline="", encoding="utf-8") as stream:
         rows = results.get("messages", [])
-        columns = ["message_id", "tunnel_id", "delivered", "e2e_ms"]
+        columns = ["message_id", "tunnel_id", "delivered", "e2e_ms", "relay_ids"]
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
-        writer.writerows({key: row.get(key) for key in columns} for row in rows)
+        writer.writerows({
+            **{key: row.get(key) for key in columns},
+            "relay_ids": json.dumps(row.get("relay_ids", [])),
+        } for row in rows)
+    storage_columns = [
+        "injection", "failed_holder_id", "replica_count_before_failure", "store_attempts", "recovered",
+    ]
+    with (output_path / "storage-failures.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=storage_columns)
+        writer.writeheader()
+        writer.writerows({key: row.get(key) for key in storage_columns}
+                         for row in results.get("storage_failure_injections", []))
+    relay_columns = [
+        "injection", "failed_relay_id", "first_attempt_failed", "recovered", "recovery_ms",
+        "replacement_relay_ids",
+    ]
+    with (output_path / "relay-failures.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=relay_columns)
+        writer.writeheader()
+        writer.writerows({
+            **{key: row.get(key) for key in relay_columns},
+            "replacement_relay_ids": json.dumps(row.get("replacement_relay_ids", [])),
+        } for row in results.get("relay_failure_injections", []))
+    with (output_path / "routing-buckets.csv").open("w", newline="", encoding="utf-8") as stream:
+        columns = ["node_id", "bucket_index", "contact_count"]
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        for node in results.get("node_tables", []):
+            writer.writerows({
+                "node_id": node["node_id"],
+                "bucket_index": bucket_index,
+                "contact_count": size,
+            } for bucket_index, size in enumerate(node["bucket_sizes"]))
+    with (output_path / "tunnel-states.csv").open("w", newline="", encoding="utf-8") as stream:
+        columns = ["time", "node_id", "tunnel_id", "role", "state"]
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows({key: row.get(key) for key in columns}
+                         for row in results.get("tunnel_states", []))
     values = [node["total_contacts"] for node in results.get("node_tables", [])]
     _write_bar_chart(output_path / "routing-tables.svg", values, "Unique routing contacts per node")
     lookup_values = [row["duration_ms"] for row in results.get("lookups", [])]

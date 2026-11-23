@@ -37,18 +37,34 @@ from .core import (
     xor_distance,
 )
 from .config import OverlayConfig
+from .security import protect_private_directory, protect_private_file
 
 
 K_BUCKET_SIZE = 3
 REPLICATION_FACTOR = 3
 RPC_TIMEOUT = 0.8
+TUNNEL_TRANSITIONS = {
+    "BUILDING": {"ACTIVE", "DEAD"},
+    "ACTIVE": {"DEGRADED", "CLOSING", "DEAD"},
+    "DEGRADED": {"CLOSING", "DEAD"},
+    "CLOSING": {"DEAD"},
+    "DEAD": set(),
+}
+
+
+def _transition_tunnel(tunnel: dict, new_state: str) -> None:
+    current_state = tunnel["state"]
+    if new_state not in TUNNEL_TRANSITIONS[current_state]:
+        raise ProtocolError(f"invalid tunnel state transition: {current_state} -> {new_state}")
+    tunnel["state"] = new_state
 
 
 def _write_private_key(path: Path, key) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    protect_private_directory(path.parent)
     path.write_bytes(key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
     ))
+    protect_private_file(path)
 
 
 class LabPKI:
@@ -60,8 +76,9 @@ class LabPKI:
         self.ca_cert_path = state_dir / "lab-ca-cert.pem"
 
     def prepare(self, count: int) -> list[tuple[Identity, EndToEndBox, Path, Path]]:
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        protect_private_directory(self.state_dir, recursive=True)
         if self.ca_key_path.exists() and self.ca_cert_path.exists():
+            protect_private_file(self.ca_key_path)
             ca_key = serialization.load_pem_private_key(self.ca_key_path.read_bytes(), password=None)
             ca_cert = x509.load_pem_x509_certificate(self.ca_cert_path.read_bytes())
         else:
@@ -85,15 +102,18 @@ class LabPKI:
         result = []
         for index in range(count):
             directory = self.state_dir / f"node-{index:02d}"
-            directory.mkdir(parents=True, exist_ok=True)
+            protect_private_directory(directory)
             identity = Identity.load_or_create(str(directory / "identity-ed25519.pem"))
             dh_path = directory / "identity-x25519.pem"
             if dh_path.exists():
+                protect_private_file(dh_path)
                 dh_key = serialization.load_pem_private_key(dh_path.read_bytes(), password=None)
             else:
                 dh_key = X25519PrivateKey.generate()
                 _write_private_key(dh_path, dh_key)
-            box = EndToEndBox(dh_key)
+            if not isinstance(dh_key, X25519PrivateKey):
+                raise ProtocolError(f"encryption key must use X25519: {dh_path}")
+            box = EndToEndBox(dh_key, directory / "replay-state.json")
             cert_path = directory / "node-cert.pem"
             if not cert_path.exists():
                 now = datetime.now(timezone.utc)
@@ -167,6 +187,7 @@ class OverlayNode:
         self.received_messages: list[dict] = []
         self.message_history: list[dict] = []
         self.tunnels: dict[str, dict] = {}
+        self.tunnel_history: list[dict] = []
         self.lookup_logs: list[dict] = []
         self.metrics: dict[str, list[float]] = {"tunnel_build_ms": [], "message_e2e_ms": [], "recovery_ms": []}
         self.rpc_counts: dict[str, int] = {}
@@ -198,6 +219,14 @@ class OverlayNode:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def _record_tunnel_state(self, tunnel_id: str, state: str, role: str) -> None:
+        event = {
+            "time": time.time(), "node_id": self.identity.node_id,
+            "tunnel_id": tunnel_id, "state": state, "role": role,
+        }
+        self.tunnel_history.append(event)
+        self._event({"event": "tunnel_state", **event})
 
     def _peer_node_id(self, writer: asyncio.StreamWriter) -> str:
         ssl_object = writer.get_extra_info("ssl_object")
@@ -268,23 +297,50 @@ class OverlayNode:
         if message_type == "TUNNEL_BUILD":
             if peer_id != payload["initiator_id"]:
                 raise ProtocolError("tunnel build initiator mismatch")
-            route = payload["route"]
+            route = payload.get("route")
+            if not isinstance(route, list) or not self.config.required_relays <= len(route) <= self.config.max_tunnel_hops:
+                raise ProtocolError("invalid tunnel relay count")
+            relay_ids = [str(item.get("node_id", "")) for item in route if isinstance(item, dict)]
+            if (len(relay_ids) != len(route) or len(set(relay_ids)) != len(route)
+                    or peer_id in relay_ids or str(payload["destination_id"]) in relay_ids):
+                raise ProtocolError("tunnel route contains invalid or repeated nodes")
             position = int(payload["position"])
             if position < 0 or position >= len(route) or route[position]["node_id"] != self.identity.node_id:
                 raise ProtocolError("invalid tunnel route position")
-            self.tunnels[str(payload["tunnel_id"])] = {
-                "initiator_id": peer_id, "destination_id": payload["destination_id"],
-                "route": route, "position": position, "state": "ACTIVE",
-                "expires_at": time.time() + self.config.tunnel_ttl_seconds,
+            tunnel_id = str(payload["tunnel_id"])
+            phase = str(payload.get("phase", "prepare"))
+            if phase == "prepare":
+                if tunnel_id in self.tunnels and self.tunnels[tunnel_id]["state"] != "DEAD":
+                    raise ProtocolError("tunnel_id is already in use")
+                self.tunnels[tunnel_id] = {
+                    "initiator_id": peer_id, "destination_id": payload["destination_id"],
+                    "route": route, "position": position, "state": "BUILDING",
+                    "role": "relay",
+                    "expires_at": time.time() + self.config.tunnel_ttl_seconds,
+                }
+                self._record_tunnel_state(tunnel_id, "BUILDING", "relay")
+            elif phase == "activate":
+                tunnel = self.tunnels.get(tunnel_id)
+                if (not tunnel or tunnel["state"] != "BUILDING" or tunnel["initiator_id"] != peer_id
+                        or tunnel["route"] != route or tunnel["position"] != position
+                        or tunnel["destination_id"] != payload["destination_id"]):
+                    raise ProtocolError("tunnel activation does not match prepared route")
+                _transition_tunnel(tunnel, "ACTIVE")
+                self._record_tunnel_state(tunnel_id, "ACTIVE", "relay")
+            else:
+                raise ProtocolError("unknown tunnel build phase")
+            return "TUNNEL_BUILD_OK", {
+                "node_id": self.identity.node_id, "tunnel_id": tunnel_id, "phase": phase,
             }
-            return "TUNNEL_BUILD_OK", {"node_id": self.identity.node_id, "tunnel_id": payload["tunnel_id"]}
         if message_type == "TUNNEL_DATA":
             return await self._forward_tunnel_data(payload, peer_id)
         if message_type == "APP_MESSAGE":
             if payload["destination_id"] != self.identity.node_id:
                 raise ProtocolError("application message addressed to another node")
             envelope = payload["envelope"]
-            plaintext = self.box.open(envelope, self.identity.node_id)
+            plaintext = self.box.open(
+                envelope, self.identity.node_id, str(payload["expected_sender_id"]),
+            )
             message = {"message_id": envelope["message_id"], "sender_id": envelope["sender_id"],
                        "text": plaintext.decode("utf-8"), "received_at": time.time(),
                        "tunnel_id": payload["tunnel_id"]}
@@ -292,8 +348,17 @@ class OverlayNode:
             self._event({"event": "message_received", **message})
             return "APP_ACK", {"message_id": envelope["message_id"], "delivered": True}
         if message_type == "TUNNEL_CLOSE":
-            self.tunnels.pop(str(payload["tunnel_id"]), None)
-            return "TUNNEL_ACK", {"closed": True}
+            tunnel_id = str(payload["tunnel_id"])
+            tunnel = self.tunnels.get(tunnel_id)
+            if tunnel and tunnel["initiator_id"] != peer_id:
+                raise ProtocolError("tunnel close initiator mismatch")
+            if tunnel and tunnel["state"] != "DEAD":
+                if tunnel["state"] != "CLOSING":
+                    _transition_tunnel(tunnel, "CLOSING")
+                    self._record_tunnel_state(tunnel_id, "CLOSING", tunnel["role"])
+                _transition_tunnel(tunnel, "DEAD")
+                self._record_tunnel_state(tunnel_id, "DEAD", tunnel["role"])
+            return "TUNNEL_ACK", {"closed": True, "tunnel_id": tunnel_id}
         raise ProtocolError(f"unsupported request: {message_type}")
 
     async def _observe_peer_from_payload(self, payload: dict, peer_id: str) -> None:
@@ -485,6 +550,10 @@ class OverlayNode:
         try:
             while True:
                 await asyncio.sleep(interval)
+                for tunnel in self.tunnels.values():
+                    if tunnel["state"] in {"BUILDING", "ACTIVE", "DEGRADED"} and tunnel["expires_at"] <= time.time():
+                        _transition_tunnel(tunnel, "DEAD")
+                        self._record_tunnel_state(tunnel["tunnel_id"], "DEAD", tunnel["role"])
                 if self.routing.all_contacts():
                     try:
                         await self.lookup_node(secrets.token_hex(32))
@@ -504,7 +573,8 @@ class OverlayNode:
         if not state or state["state"] != "ACTIVE":
             raise ProtocolError("tunnel is not active")
         if state["expires_at"] <= time.time():
-            state["state"] = "DEAD"
+            _transition_tunnel(state, "DEAD")
+            self._record_tunnel_state(tunnel_id, "DEAD", state["role"])
             raise ProtocolError("tunnel TTL expired")
         route = state["route"]
         position = int(payload["position"])
@@ -518,17 +588,30 @@ class OverlayNode:
         if position + 1 < len(route):
             next_contact = Contact.from_dict(route[position + 1])
             next_payload = {**payload, "position": position + 1}
-            return "TUNNEL_ACK", await self.rpc(next_contact, "TUNNEL_DATA", next_payload)
+            try:
+                response = await self.rpc(next_contact, "TUNNEL_DATA", next_payload)
+            except Exception:
+                _transition_tunnel(state, "DEGRADED")
+                self._record_tunnel_state(tunnel_id, "DEGRADED", state["role"])
+                raise
+            return "TUNNEL_ACK", response
         destination = Contact.from_dict(payload["destination"])
-        response = await self.rpc(destination, "APP_MESSAGE", {
-            "destination_id": state["destination_id"], "tunnel_id": tunnel_id,
-            "envelope": payload["envelope"],
-        })
+        try:
+            response = await self.rpc(destination, "APP_MESSAGE", {
+                "destination_id": state["destination_id"], "tunnel_id": tunnel_id,
+                "expected_sender_id": state["initiator_id"], "envelope": payload["envelope"],
+            })
+        except Exception:
+            _transition_tunnel(state, "DEGRADED")
+            self._record_tunnel_state(tunnel_id, "DEGRADED", state["role"])
+            raise
         return "TUNNEL_ACK", response
 
     async def build_tunnel(self, destination_id: str, relay_count: int | None = None,
                            excluded_ids: set[str] | None = None) -> dict:
-        relay_count = relay_count or self.config.required_relays
+        relay_count = self.config.required_relays if relay_count is None else relay_count
+        if relay_count < self.config.required_relays:
+            raise ProtocolError(f"at least {self.config.required_relays} relays are required")
         if relay_count > self.config.max_tunnel_hops:
             raise ProtocolError("requested relay count exceeds max_tunnel_hops")
         started = time.perf_counter()
@@ -561,17 +644,44 @@ class OverlayNode:
             raise ProtocolError("tunnel contains a repeated or endpoint node")
         tunnel_id = uuid.uuid4().hex
         route = [peer.to_dict() for peer in live]
-        for position, relay in enumerate(live):
-            response = await self.rpc(relay, "TUNNEL_BUILD", {
-                "tunnel_id": tunnel_id, "initiator_id": self.identity.node_id,
-                "destination_id": destination_id, "route": route, "position": position,
-            })
-            if response.get("node_id") != relay.node_id:
-                raise ProtocolError("relay did not confirm tunnel build")
-        build_ms = (time.perf_counter() - started) * 1000
         tunnel = {"tunnel_id": tunnel_id, "destination": destination, "route": live,
-                  "state": "ACTIVE", "built_at": time.time(), "build_ms": build_ms}
+                  "state": "BUILDING", "built_at": time.time(),
+                  "role": "initiator", "expires_at": time.time() + self.config.tunnel_ttl_seconds}
         self.tunnels[tunnel_id] = tunnel
+        self._record_tunnel_state(tunnel_id, "BUILDING", "initiator")
+        prepared: list[Contact] = []
+        try:
+            for phase in ("prepare", "activate"):
+                for position, relay in enumerate(live):
+                    response = await self.rpc(relay, "TUNNEL_BUILD", {
+                        "tunnel_id": tunnel_id, "initiator_id": self.identity.node_id,
+                        "destination_id": destination_id, "route": route, "position": position,
+                        "phase": phase,
+                    })
+                    if (response.get("node_id") != relay.node_id or response.get("tunnel_id") != tunnel_id
+                            or response.get("phase") != phase):
+                        raise ProtocolError("relay did not confirm tunnel phase")
+                    if phase == "prepare":
+                        prepared.append(relay)
+            _transition_tunnel(tunnel, "ACTIVE")
+            self._record_tunnel_state(tunnel_id, "ACTIVE", "initiator")
+        except Exception as exc:
+            cleanup_errors = []
+            for relay in prepared:
+                try:
+                    response = await self.rpc(relay, "TUNNEL_CLOSE", {"tunnel_id": tunnel_id})
+                    if not response.get("closed"):
+                        cleanup_errors.append(f"{relay.node_id}: close was not acknowledged")
+                except Exception as cleanup_error:
+                    cleanup_errors.append(f"{relay.node_id}: {type(cleanup_error).__name__}")
+            if tunnel["state"] != "DEAD":
+                _transition_tunnel(tunnel, "DEAD")
+                self._record_tunnel_state(tunnel_id, "DEAD", "initiator")
+            self._event({"event": "tunnel_build_failed", "tunnel_id": tunnel_id,
+                         "error": str(exc)[:128], "cleanup_errors": cleanup_errors})
+            raise
+        build_ms = (time.perf_counter() - started) * 1000
+        tunnel["build_ms"] = build_ms
         self.metrics["tunnel_build_ms"].append(build_ms)
         self._event({"event": "tunnel_built", "tunnel_id": tunnel_id,
                      "destination_id": destination_id, "relay_ids": [peer.node_id for peer in live],
@@ -579,22 +689,27 @@ class OverlayNode:
         return tunnel
 
     async def send_via_tunnel(self, tunnel: dict, text: str) -> dict:
+        if tunnel["state"] != "ACTIVE":
+            raise ProtocolError("tunnel is not active")
+        if tunnel["expires_at"] <= time.time():
+            _transition_tunnel(tunnel, "DEAD")
+            raise ProtocolError("tunnel TTL expired")
         started = time.perf_counter()
         destination = tunnel["destination"]
-        record = await self.get_record(node_record_key(destination.node_id))
-        if not record or not record.encryption_public_key:
-            raise ProtocolError("destination encryption key unavailable")
-        envelope = self.box.seal(
-            bytes.fromhex(record.encryption_public_key), self.identity, destination.node_id,
-            text.encode("utf-8"),
-        )
         try:
+            record = await self.get_record(node_record_key(destination.node_id))
+            if not record or not record.encryption_public_key:
+                raise ProtocolError("destination encryption key unavailable")
+            envelope = self.box.seal(
+                bytes.fromhex(record.encryption_public_key), self.identity, destination.node_id,
+                text.encode("utf-8"),
+            )
             first = tunnel["route"][0]
             response = await self.rpc(first, "TUNNEL_DATA", {
                 "tunnel_id": tunnel["tunnel_id"], "position": 0,
                 "destination": destination.to_dict(), "envelope": envelope,
             })
-            if not response.get("delivered"):
+            if not response.get("delivered") or response.get("message_id") != envelope["message_id"]:
                 raise ProtocolError("application acknowledgement missing")
             elapsed = (time.perf_counter() - started) * 1000
             self.metrics["message_e2e_ms"].append(elapsed)
@@ -605,8 +720,30 @@ class OverlayNode:
             self._event({"event": "message_sent", **result})
             return result
         except Exception:
-            tunnel["state"] = "DEGRADED"
+            _transition_tunnel(tunnel, "DEGRADED")
+            self._record_tunnel_state(tunnel["tunnel_id"], "DEGRADED", "initiator")
             raise
+
+    async def close_tunnel(self, tunnel: dict) -> None:
+        if tunnel["state"] == "DEAD":
+            return
+        if tunnel["state"] != "CLOSING":
+            _transition_tunnel(tunnel, "CLOSING")
+            self._record_tunnel_state(tunnel["tunnel_id"], "CLOSING", "initiator")
+        replies = await asyncio.gather(*(
+            self.rpc(relay, "TUNNEL_CLOSE", {"tunnel_id": tunnel["tunnel_id"]})
+            for relay in tunnel["route"]
+        ), return_exceptions=True)
+        errors = [f"{relay.node_id}: {type(reply).__name__}"
+                  for relay, reply in zip(tunnel["route"], replies)
+                  if (isinstance(reply, Exception) or not reply.get("closed")
+                      or reply.get("tunnel_id") != tunnel["tunnel_id"])]
+        _transition_tunnel(tunnel, "DEAD")
+        self._record_tunnel_state(tunnel["tunnel_id"], "DEAD", "initiator")
+        self._event({"event": "tunnel_closed", "tunnel_id": tunnel["tunnel_id"],
+                     "close_errors": errors})
+        if errors:
+            raise ProtocolError("one or more relays did not confirm tunnel closure: " + "; ".join(errors))
 
     async def send_with_recovery(self, destination_id: str, text: str,
                                  failed_relay_ids: set[str] | None = None) -> dict:
@@ -614,8 +751,9 @@ class OverlayNode:
         started = time.perf_counter()
         last_error: Exception | None = None
         for attempt in range(2):
-            tunnel = await self.build_tunnel(destination_id, excluded_ids=excluded)
+            tunnel = None
             try:
+                tunnel = await self.build_tunnel(destination_id, excluded_ids=excluded)
                 result = await self.send_via_tunnel(tunnel, text)
                 if attempt:
                     recovery_ms = (time.perf_counter() - started) * 1000
@@ -625,10 +763,16 @@ class OverlayNode:
             except Exception as exc:
                 last_error = exc
                 failed_relays = []
-                for peer in tunnel["route"]:
-                    if not await self._ping(peer):
-                        failed_relays.append(peer.node_id)
-                excluded.update(failed_relays or [peer.node_id for peer in tunnel["route"]])
+                if tunnel is not None:
+                    for peer in tunnel["route"]:
+                        if not await self._ping(peer):
+                            failed_relays.append(peer.node_id)
+                    excluded.update(failed_relays or [peer.node_id for peer in tunnel["route"]])
+                    try:
+                        await self.close_tunnel(tunnel)
+                    except ProtocolError as close_error:
+                        self._event({"event": "tunnel_recovery_close_error",
+                                     "tunnel_id": tunnel["tunnel_id"], "error": str(close_error)[:128]})
         raise ProtocolError(f"delivery failed after tunnel rebuild: {last_error}") from last_error
 
 
@@ -642,6 +786,8 @@ class OverlayNetwork:
         self.bootstrap = bootstrap
         self.config = config or OverlayConfig(bucket_size=bucket_size)
         self.config.validate()
+        if bootstrap not in {"star", "ring"}:
+            raise ValueError("bootstrap must be star or ring")
         self.pki = LabPKI(self.state_dir)
         self.nodes: list[OverlayNode] = []
         self.contacts: list[Contact] = []

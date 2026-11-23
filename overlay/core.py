@@ -9,6 +9,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Awaitable, Callable
 
 from cryptography.exceptions import InvalidSignature, InvalidTag
@@ -17,6 +18,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from .security import protect_private_directory, protect_private_file
 
 
 PROTOCOL_VERSION = 1
@@ -129,27 +132,32 @@ class Identity:
             return False
 
     def save(self, path: str) -> None:
+        private_path = Path(path)
+        if private_path.parent != Path("."):
+            protect_private_directory(private_path.parent)
         encoded = self.signing_key.private_bytes(
             serialization.Encoding.PEM,
             serialization.PrivateFormat.PKCS8,
             serialization.NoEncryption(),
         )
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "wb") as key_file:
+        with private_path.open("wb") as key_file:
             key_file.write(encoded)
+        protect_private_file(private_path)
 
     @classmethod
     def load_or_create(cls, path: str) -> Identity:
-        if os.path.exists(path):
-            with open(path, "rb") as key_file:
+        private_path = Path(path)
+        if private_path.parent != Path("."):
+            protect_private_directory(private_path.parent)
+        if private_path.exists():
+            protect_private_file(private_path)
+            with private_path.open("rb") as key_file:
                 key = serialization.load_pem_private_key(key_file.read(), password=None)
             if not isinstance(key, Ed25519PrivateKey):
                 raise ProtocolError("identity key must use Ed25519")
             return cls(key)
         identity = cls()
-        identity.save(path)
+        identity.save(str(private_path))
         return identity
 
 
@@ -310,13 +318,61 @@ def node_record_key(node_id: str) -> str:
 
 
 class EndToEndBox:
-    def __init__(self, private_key: X25519PrivateKey | None = None):
+    MAX_REPLAY_ENTRIES = 100_000
+
+    def __init__(self, private_key: X25519PrivateKey | None = None,
+                 replay_state_path: str | Path | None = None):
         self.private_key = private_key or X25519PrivateKey.generate()
         self.public_bytes = self.private_key.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw,
         )
         self.seen_messages: set[tuple[str, str]] = set()
         self.closed_sessions: set[str] = set()
+        self.replay_state_path = Path(replay_state_path) if replay_state_path else None
+        self._replay_directory_protected = False
+        if self.replay_state_path:
+            if self.replay_state_path.parent != Path("."):
+                protect_private_directory(self.replay_state_path.parent)
+                self._replay_directory_protected = True
+        if self.replay_state_path and self.replay_state_path.exists():
+            protect_private_file(self.replay_state_path)
+            try:
+                state = json.loads(self.replay_state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict) or state.get("version") != 1:
+                    raise ValueError("unsupported replay-state version")
+                self.seen_messages = {
+                    (str(item[0]), str(item[1])) for item in state["seen_messages"]
+                }
+                self.closed_sessions = {str(item) for item in state["closed_sessions"]}
+                if len(self.seen_messages) > self.MAX_REPLAY_ENTRIES:
+                    raise ValueError("replay state exceeds the configured capacity")
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise ProtocolError(f"invalid replay state at {self.replay_state_path}") from exc
+
+    def _persist_replay_state(self) -> None:
+        if self.replay_state_path is None:
+            return
+        temporary_path = self.replay_state_path.with_name(
+            self.replay_state_path.name + f".{uuid.uuid4().hex}.tmp"
+        )
+        state = {
+            "version": 1,
+            "seen_messages": sorted([list(item) for item in self.seen_messages]),
+            "closed_sessions": sorted(self.closed_sessions),
+        }
+        try:
+            with temporary_path.open("w", encoding="utf-8") as state_file:
+                json.dump(state, state_file, separators=(",", ":"), sort_keys=True)
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            if os.name != "nt" or not self._replay_directory_protected:
+                protect_private_file(temporary_path)
+            os.replace(temporary_path, self.replay_state_path)
+            if os.name != "nt" or not self._replay_directory_protected:
+                protect_private_file(self.replay_state_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
 
     @staticmethod
     def _derive(shared_secret: bytes, session_id: str, sender_id: str, recipient_id: str) -> bytes:
@@ -348,6 +404,8 @@ class EndToEndBox:
         replay_key = (session_id, message_id)
         if session_id in self.closed_sessions or replay_key in self.seen_messages:
             raise ProtocolError("replayed or closed-session message")
+        if len(self.seen_messages) >= self.MAX_REPLAY_ENTRIES:
+            raise ProtocolError("replay protection capacity reached; refusing new messages")
         if envelope["recipient_id"] != expected_recipient_id:
             raise ProtocolError("recipient mismatch")
         sender_id = str(envelope["sender_id"])
@@ -370,7 +428,10 @@ class EndToEndBox:
         except (InvalidTag, ValueError) as exc:
             raise ProtocolError("invalid encrypted message") from exc
         self.seen_messages.add(replay_key)
+        self.closed_sessions.add(session_id)
+        self._persist_replay_state()
         return plaintext
 
     def close_session(self, session_id: str) -> None:
         self.closed_sessions.add(session_id)
+        self._persist_replay_state()

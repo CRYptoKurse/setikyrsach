@@ -40,8 +40,22 @@ def validate_run(result: dict) -> dict[str, bool]:
     relay_failures = result["relay_failure_injections"]
     messages = result["messages"]
     required_relays = result["config"]["profile"]["required_relays"]
+    profile = result["config"]["profile"]
+    capture = result.get("capture", {})
+    tunnel_states = {row["state"] for row in result.get("tunnel_states", [])}
     return {
+        "simplified_profile_parameters": (
+            12 <= count <= 15 and bucket_size == 3 and result["config"]["alpha"] == 3
+            and result["config"]["replication_factor"] == 3 and required_relays == 2
+            and profile["bucket_size"] == 3 and profile["alpha"] == 3
+            and profile["replication_factor"] == 3
+        ),
+        "bootstrap_scheme_recorded": result["config"]["bootstrap"] in {"star", "ring"},
         "operational_convergence": result["config"]["operationally_converged"],
+        "pcapng_without_application_plaintext": (
+            capture.get("format") == "pcapng" and capture.get("packet_count", 0) > 0
+            and capture.get("contains_application_plaintext") is False
+        ),
         "non_degenerate_bounded_dht": dht_non_degenerate,
         "30_absent_target_lookups_via_intermediary": (
             len(lookups) >= 30 and all(row["target_absent_before"] and row["used_intermediate"]
@@ -58,6 +72,7 @@ def validate_run(result: dict) -> dict[str, bool]:
             len(messages) >= 30 and all(row["delivered"] and len(row["relay_ids"]) == required_relays
                                         and len(set(row["relay_ids"])) == required_relays for row in messages[:30])
         ),
+        "tunnel_state_lifecycle": {"BUILDING", "ACTIVE", "DEGRADED", "CLOSING", "DEAD"} <= tunnel_states,
         "five_relay_failure_recoveries": (
             len(relay_failures) >= 5 and all(row["first_attempt_failed"] and row["recovered"]
                                              and len(row["replacement_relay_ids"]) == required_relays
@@ -67,9 +82,9 @@ def validate_run(result: dict) -> dict[str, bool]:
     }
 
 
-async def run_study(output_dir: str | Path, count: int = 12, runs_per_scheme: int = 5,
+async def run_study(output_dir: str | Path, count: int = 15, runs_per_scheme: int = 5,
                     base_port: int = 21000, seed: int = 20261012,
-                    config: OverlayConfig | None = None) -> dict:
+                    config: OverlayConfig | None = None, capture_packets: bool = True) -> dict:
     if not 12 <= count <= 15:
         raise ValueError("the simplified study uses 12..15 logical nodes")
     if runs_per_scheme < 5:
@@ -89,7 +104,7 @@ async def run_study(output_dir: str | Path, count: int = 12, runs_per_scheme: in
             run_dir = root / scheme / f"run-{run_index + 1:02d}"
             port = base_port + (run_index * 2 + scheme_index) * (count + 16)
             result = await run_acceptance(
-                run_dir, count, scheme, port, paired_seed, active_config,
+                run_dir, count, scheme, port, paired_seed, active_config, capture_packets,
             )
             checks = validate_run(result)
             all_results[scheme].append(result)
@@ -141,6 +156,7 @@ async def run_study(output_dir: str | Path, count: int = 12, runs_per_scheme: in
                 "messages": len(message_values),
                 "storage_failures": sum(len(result["storage_failure_injections"]) for result in results),
                 "relay_failures": len(recovery_values),
+                "pcapng_packets": sum(result.get("capture", {}).get("packet_count", 0) for result in results),
             },
         }
 

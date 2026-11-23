@@ -25,16 +25,22 @@ class OverlayConfig:
     def validate(self) -> None:
         if self.node_id_bits != 256:
             raise ValueError("NodeID uses SHA-256 and therefore has 256 bits")
-        if self.bucket_size < 1 or self.alpha < 1 or self.replication_factor < 1:
-            raise ValueError("bucket_size, alpha and replication_factor must be positive")
+        if self.bucket_size != 3:
+            raise ValueError("the simplified profile requires bucket_size=3")
+        if self.alpha != 3:
+            raise ValueError("the simplified profile requires alpha=3")
+        if self.replication_factor != 3:
+            raise ValueError("the simplified profile requires replication_factor=3")
         if not 120 <= self.record_ttl_seconds <= 300:
             raise ValueError("record TTL must be between 120 and 300 seconds")
         if self.refresh_interval_seconds < 1 or self.republish_interval_seconds < 1:
             raise ValueError("maintenance intervals must be positive")
         if self.republish_interval_seconds > self.record_ttl_seconds / 2:
             raise ValueError("republish interval must not exceed half the record TTL")
-        if self.rpc_timeout_seconds <= 0 or self.required_relays < 2:
-            raise ValueError("timeout must be positive and simplified profile requires at least two relays")
+        if self.rpc_timeout_seconds <= 0:
+            raise ValueError("timeout must be positive")
+        if self.required_relays != 2:
+            raise ValueError("the simplified profile requires exactly two relays")
         if self.max_tunnel_hops < self.required_relays or self.tunnel_ttl_seconds < 1:
             raise ValueError("invalid tunnel hop or TTL limits")
         if self.max_frame_payload != MAX_FRAME_PAYLOAD:
