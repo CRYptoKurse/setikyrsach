@@ -8,10 +8,22 @@ def accepted_result() -> dict:
     return {
         "config": {
             "node_count": 12,
+            "bootstrap": "star",
             "bucket_size": 3,
+            "alpha": 3,
+            "replication_factor": 3,
             "operationally_converged": True,
-            "profile": {"required_relays": 2},
+            "profile": {
+                "bucket_size": 3, "alpha": 3, "replication_factor": 3, "required_relays": 2,
+            },
         },
+        "capture": {
+            "format": "pcapng", "packet_count": 100, "contains_application_plaintext": False,
+        },
+        "tunnel_states": [
+            {"state": state}
+            for state in ("BUILDING", "ACTIVE", "DEGRADED", "CLOSING", "DEAD")
+        ],
         "node_tables": [{"total_contacts": 8, "bucket_sizes": [1] * 8 + [0] * 248} for _ in range(12)],
         "lookups": [{"target_absent_before": True, "used_intermediate": True, "target_found": True}
                     for _ in range(30)],
@@ -40,6 +52,15 @@ class StudyValidationTests(unittest.TestCase):
         for node in result["node_tables"]:
             node["total_contacts"] = 11
         self.assertFalse(validate_run(result)["non_degenerate_bounded_dht"])
+
+    def test_rejects_missing_capture_and_profile_override(self):
+        result = accepted_result()
+        result.pop("capture")
+        self.assertFalse(validate_run(result)["pcapng_without_application_plaintext"])
+
+        result = accepted_result()
+        result["config"]["profile"]["alpha"] = 2
+        self.assertFalse(validate_run(result)["simplified_profile_parameters"])
 
 
 if __name__ == "__main__":

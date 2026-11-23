@@ -1,6 +1,8 @@
 import asyncio
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
 from overlay.core import (
     Contact,
@@ -134,6 +136,13 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             OverlayConfig(republish_interval_seconds=91).validate()
 
+    def test_simplified_profile_parameters_cannot_be_overridden(self):
+        for override in (
+            {"bucket_size": 4}, {"alpha": 2}, {"replication_factor": 2}, {"required_relays": 3},
+        ):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                OverlayConfig(**override).validate()
+
 
 class EndToEndTests(unittest.TestCase):
     def test_authenticated_encryption_rejects_tamper_replay_and_wrong_recipient(self):
@@ -154,6 +163,32 @@ class EndToEndTests(unittest.TestCase):
             fresh.open(tampered, recipient_identity.node_id, sender.node_id)
         with self.assertRaises(ProtocolError):
             fresh.open(envelope, Identity().node_id)
+
+    def test_replay_is_rejected_after_reload_and_session_close_is_persistent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            replay_path = Path(directory) / "replay-state.json"
+            sender = Identity()
+            recipient_identity = Identity()
+            first_box = EndToEndBox()
+            recipient = EndToEndBox(replay_state_path=replay_path)
+            envelope = first_box.seal(
+                recipient.public_bytes, sender, recipient_identity.node_id, b"single use",
+            )
+            self.assertEqual(
+                recipient.open(envelope, recipient_identity.node_id, sender.node_id), b"single use",
+            )
+
+            restarted = EndToEndBox(recipient.private_key, replay_path)
+            with self.assertRaises(ProtocolError):
+                restarted.open(envelope, recipient_identity.node_id, sender.node_id)
+
+            closed_envelope = first_box.seal(
+                restarted.public_bytes, sender, recipient_identity.node_id, b"closed session",
+            )
+            restarted.close_session(closed_envelope["session_id"])
+            after_close = EndToEndBox(restarted.private_key, replay_path)
+            with self.assertRaises(ProtocolError):
+                after_close.open(closed_envelope, recipient_identity.node_id, sender.node_id)
 
 
 if __name__ == "__main__":
